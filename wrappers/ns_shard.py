@@ -28,7 +28,7 @@ class ModelWrapper(BaseModelWrapper):
         self.steps_per_epoch = hps.train.steps_per_epoch
 
     def set_keys(self):
-        self.keys = ["speech", "speech_clean", "noise"]
+        self.keys = ["speech", "speech_clean", "noise", "id_speech"]
         if self.load_reverb:
             self.keys += ["rir", "rir_onset", "rir_t60"]
         self.val_keys = ["clean", "noisy"]
@@ -116,6 +116,6 @@ class ModelWrapper(BaseModelWrapper):
         self.optim.zero_grad(set_to_none=True)
 
         summary["scalars"] = {
-            f"{k}/train": v for k, v in self.loss.reduce().items()
+            f"{k}": v for k, v in self.loss.reduce().items()
         }
         return summary

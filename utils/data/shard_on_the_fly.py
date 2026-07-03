@@ -1306,8 +1306,8 @@ class DynamicMixer:
             inp_speech = _batch_convolve_rir(inp_speech, batch.rir)
 
         # ── 2. speech_clean target ─────────────────────────────────────────────
-        speech_clean: Optional[Tensor] = None
-        if batch.speech_clean is not None:
+        speech_clean: Optional[Tensor] = batch.speech_clean
+        if speech_clean is not None:
             if self.rir_target_type == "anechoic" or batch.rir is None:
                 rir_target = None
             elif self.rir_target_type is None:
@@ -1335,7 +1335,7 @@ class DynamicMixer:
                 )
 
             if rir_target is not None:
-                speech_clean = _batch_convolve_rir(batch.speech_clean, rir_target)
+                speech_clean = _batch_convolve_rir(speech_clean, rir_target)
 
         # ── 3. dBFS normalisation ──────────────────────────────────────────────
         rms = segmental_rms(

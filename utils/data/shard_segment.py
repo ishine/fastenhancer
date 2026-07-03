@@ -93,7 +93,12 @@ def _segment_collate_fn(samples: List[ShardBatch]) -> ShardBatch:
         vals = [getattr(s, key) for s in samples]
         if all(v is None for v in vals):
             return None
-        return torch.stack([v for v in vals if v is not None])
+        # Use zeros for missing entries so the batch dimension stays intact.
+        proto = next(v for v in vals if v is not None)
+        return torch.stack([
+            v if v is not None else torch.zeros_like(proto)
+            for v in vals
+        ])
 
     def _str_list(key: str) -> Optional[List[str]]:
         vals = [getattr(s, key) for s in samples]
@@ -101,16 +106,21 @@ def _segment_collate_fn(samples: List[ShardBatch]) -> ShardBatch:
             return None
         return [v if v is not None else "" for v in vals]
 
-    # RIR: pad each item to the batch maximum length
+    # RIR: pad each item to the batch maximum length.
+    # None entries (no reverb) become a unit impulse [1, 0, 0, …] — the
+    # identity for convolution — rather than all-zeros which would silence audio.
     rir_vals = [s.rir for s in samples]
     if all(v is None for v in rir_vals):
         rir_t = None
     else:
         max_len = max(v.shape[-1] for v in rir_vals if v is not None)
-        rir_t = torch.stack([
-            F.pad(v, (0, max_len - v.shape[-1]))
-            for v in rir_vals
-        ])
+        def _rir_or_impulse(v):
+            if v is not None:
+                return F.pad(v, (0, max_len - v.shape[-1]))
+            impulse = torch.zeros(1, max_len)
+            impulse[0, 0] = 1.0
+            return impulse
+        rir_t = torch.stack([_rir_or_impulse(v) for v in rir_vals])
 
     return ShardBatch(
         speech          = _stack("speech"),
@@ -172,6 +182,17 @@ class ShardSegmentDataset(data.Dataset):
         Per-item probability of using codec-degraded audio as speech while
         returning the original clean audio as speech_clean.  Requires
         "speech_clean" in keys and codec shards in speech_sources.
+    prob_speech_reverb:
+        Per-item probability of including a RIR.  When the roll fails, rir /
+        rir_onset / rir_t60 are returned as None for that item even if
+        rir_sources were provided.
+    prob_farend_echo:
+        Per-item probability of including farend / echo.  When the roll fails
+        the item has no farend/echo contamination.
+    prob_farend_only:
+        Conditional probability: given that farend/echo *is* included, the
+        probability that no noise is also added.  Mirrors the v3 config field
+        of the same name (farend-only contamination, no background noise).
     keys:
         Controls which fields are loaded and returned.
     """
@@ -190,6 +211,9 @@ class ShardSegmentDataset(data.Dataset):
         base_seed:            int   = 42,
         silence_length:       float = 0.1,
         prob_speech_codec:    float = 0.0,
+        prob_speech_reverb:   float = 1.0,
+        prob_farend_echo:     float = 1.0,
+        prob_farend_only:     float = 0.0,
         keys: tp.List[str]        = ("speech",),
     ):
         super().__init__()
@@ -210,8 +234,11 @@ class ShardSegmentDataset(data.Dataset):
         self.sampling_rate     = sampling_rate
         self._shuffle          = shuffle
         self.aux_buffer_size   = aux_buffer_size
-        self._silence_len      = max(0, int(silence_length * sampling_rate))
-        self.prob_speech_codec = prob_speech_codec
+        self._silence_len       = max(0, int(silence_length * sampling_rate))
+        self.prob_speech_codec  = prob_speech_codec
+        self.prob_speech_reverb = prob_speech_reverb
+        self.prob_farend_echo   = prob_farend_echo
+        self.prob_farend_only   = prob_farend_only
 
         self.keys: tp.Set[str] = set(keys)
 
@@ -451,20 +478,18 @@ class ShardSegmentDataset(data.Dataset):
         )
         speech, speech_clean, id_speech = self._gen_speech(self._speech_iter, load_codec)
 
-        # ── Noise ──────────────────────────────────────────────────────────────
-        noise:       Optional[np.ndarray] = None
-        id_noise:    Optional[str]        = None
-        if "noise" in self.keys and self._noise_iter is not None:
-            noise_arr, _, id_noise_list, _ = self._gen_audio(self._noise_iter)
-            noise    = noise_arr
-            id_noise = "|".join(id_noise_list)
-
         # ── Farend + Echo ──────────────────────────────────────────────────────
+        use_farend = (
+            ("farend" in self.keys or "echo" in self.keys)
+            and self._fe_iter is not None
+            and random.random() < self.prob_farend_echo
+        )
         farend:    Optional[np.ndarray] = None
         echo:      Optional[np.ndarray] = None
         is_real:   bool                 = False
         id_fe:     Optional[str]        = None
-        if ("farend" in self.keys or "echo" in self.keys) and self._fe_iter is not None:
+        farend_only: bool               = False
+        if use_farend:
             farend_arr, echo_arr, id_fe_list, is_real = self._gen_audio(
                 self._fe_iter, echo_field="echo" in self.keys
             )
@@ -473,13 +498,26 @@ class ShardSegmentDataset(data.Dataset):
             if "echo" in self.keys:
                 echo = echo_arr
             id_fe = "|".join(id_fe_list)
+            farend_only = random.random() < self.prob_farend_only
+
+        # ── Noise ──────────────────────────────────────────────────────────────
+        noise:       Optional[np.ndarray] = None
+        id_noise:    Optional[str]        = None
+        if "noise" in self.keys and self._noise_iter is not None and not farend_only:
+            noise_arr, _, id_noise_list, _ = self._gen_audio(self._noise_iter)
+            noise    = noise_arr
+            id_noise = "|".join(id_noise_list)
 
         # ── RIR ────────────────────────────────────────────────────────────────
         rir:       Optional[np.ndarray] = None
         rir_onset: Optional[int]        = None
         rir_t60:   Optional[float]      = None
         id_rir:    Optional[str]        = None
-        if "rir" in self.keys and self._rir_iter is not None:
+        if (
+            "rir" in self.keys
+            and self._rir_iter is not None
+            and random.random() < self.prob_speech_reverb
+        ):
             rir, rir_onset, rir_t60, id_rir = self._load_rir(self._rir_iter)
 
         return ShardBatch(
@@ -547,6 +585,9 @@ def build_shard_segment_dataloader_from_hps(
         base_seed           = hparams.train.seed,
         silence_length      = hp.get("silence_length", 0.1),
         prob_speech_codec   = hp.get("prob_speech_codec", 0.0),
+        prob_speech_reverb  = hp.get("prob_speech_reverb", 1.0),
+        prob_farend_echo    = hp.get("prob_farend_echo", 1.0),
+        prob_farend_only    = hp.get("prob_farend_only", 0.0),
         keys                = keys,
         num_workers         = hp.get("num_workers", 0),
         pin_memory          = hp.get("pin_memory", False),
@@ -569,6 +610,9 @@ def build_shard_segment_dataloader(
     base_seed:            int   = 42,
     silence_length:       float = 0.1,
     prob_speech_codec:    float = 0.0,
+    prob_speech_reverb:   float = 1.0,
+    prob_farend_echo:     float = 1.0,
+    prob_farend_only:     float = 0.0,
     keys: tp.List[str]        = ("speech",),
     num_workers:          int   = 0,
     pin_memory:           bool  = False,
@@ -589,6 +633,9 @@ def build_shard_segment_dataloader(
         base_seed           = base_seed,
         silence_length      = silence_length,
         prob_speech_codec   = prob_speech_codec,
+        prob_speech_reverb  = prob_speech_reverb,
+        prob_farend_echo    = prob_farend_echo,
+        prob_farend_only    = prob_farend_only,
         keys                = keys,
     )
     loader = torch.utils.data.DataLoader(
